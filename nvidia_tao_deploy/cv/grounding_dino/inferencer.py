@@ -34,7 +34,7 @@ def trt_output_process_fn(y_encoded, batch_size, num_classes):
         pred_logits (np.ndarray): (B x NQ x N) logits of the prediction
         pred_boxes (np.ndarray): (B x NQ x 4) bounding boxes of the prediction
     """
-    pred_boxes, pred_logits = y_encoded
+    pred_logits, pred_boxes = y_encoded
     return pred_logits.reshape((batch_size, -1, num_classes)), pred_boxes.reshape((batch_size, -1, 4))
 
 
@@ -51,28 +51,30 @@ class GDINOInferencer(TRTInferencer):
             batch_size (int): batch size for dynamic shape engine
             data_format (str): either channel_first or channel_last
         """
-        # Load TRT engine
+
         super().__init__(engine_path)
-        self.max_batch_size = self.engine.max_batch_size
-        self.execute_v2 = False
-
-        # Execution context is needed for inference
         self.context = None
-
+        self.execute_v2 = False
         # Allocate memory for multiple usage [e.g. multiple batch inference]
         self._input_shape = []
         self.context = self.engine.create_execution_context()
-        for binding in range(self.engine.num_bindings):
-            # set binding_shape for dynamic input
-            if self.engine.binding_is_input(binding):
-                _input_shape = self.engine.get_binding_shape(binding)[1:]
-                self._input_shape.append(_input_shape)
-                self.context.set_binding_shape(binding, [batch_size] + list(_input_shape))
-                if binding == 0 and len(_input_shape) == 3:
-                    self.height = _input_shape[1]
-                    self.width = _input_shape[2]
-        self.max_batch_size = batch_size
-        self.execute_v2 = True
+
+        for i in range(self.engine.num_io_tensors):
+            name = self.engine.get_tensor_name(i)
+            if self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
+                # Get the profile's optimal shape (min/opt/max available via get_profile_shape)
+                opt_shape = self.engine.get_tensor_profile_shape(name, 0)[1]  # 0 = profile index, 1 = opt
+                input_shape = list(opt_shape)
+                self._input_shape.append(input_shape)
+
+                # Set shape for this tensor in the context
+                self.context.set_input_shape(name, input_shape)
+
+                # Optional height/width capture for main image input
+                if i == 0 and len(input_shape) == 4:  # shape: [batch, C, H, W]
+                    self.height = input_shape[2]
+                    self.width = input_shape[3]
+                    self.max_batch_size = self.engine.get_tensor_profile_shape(name, 0)[2][0]
 
         self.num_classes = num_classes
 
@@ -88,40 +90,35 @@ class GDINOInferencer(TRTInferencer):
             np.zeros((self.max_batch_size, volume), dtype=dtype) for volume, dtype in zip(input_volumes, dtypes)
         ]
 
-    def infer(self, inputs):
-        """Infers model on batch of same sized images resized to fit the model.
 
-        Args:
-            image_paths (str): paths to images, that will be packed into batch
-                and fed into model
-        """
-        # Verify if the supplied batch size is not too big
+    def infer(self, inputs):
+        """Infers model on batch of same sized images resized to fit the model."""
         max_batch_size = self.max_batch_size
+
         for idx, inp in enumerate(inputs):
             actual_batch_size = len(inp)
             if actual_batch_size > max_batch_size:
                 raise ValueError(
-                    f"image_paths list bigger ({actual_batch_size}) than "
-                    f"engine max batch size ({max_batch_size})"
+                    f"Input batch size ({actual_batch_size}) exceeds max batch size ({max_batch_size})"
                 )
+
+            # Ensure numpy_array is large enough
+            if actual_batch_size > self.numpy_array[idx].shape[0]:
+                raise IndexError(f"Index out of range for numpy_array[{idx}], shape: {self.numpy_array[idx].shape}")
+
+            # Reshape input to match the expected size and copy to numpy_array
             self.numpy_array[idx][:actual_batch_size] = inp.reshape(actual_batch_size, -1)
-            # ...copy them into appropriate place into memory...
-            # (self.inputs was returned earlier by allocate_buffers())
             np.copyto(self.inputs[idx].host, self.numpy_array[idx].ravel())
 
-        # ...fetch model outputs...
+        # Run inference
         results = do_inference(
-            self.context, bindings=self.bindings, inputs=self.inputs,
+            self.context, inputs=self.inputs,
             outputs=self.outputs, stream=self.stream,
-            batch_size=max_batch_size,
-            execute_v2=self.execute_v2)
+        )
 
-        # ...and return results up to the actual batch size.
+        # Process TRT outputs
         y_pred = [i.reshape(max_batch_size, -1)[:actual_batch_size] for i in results]
-
-        # Process TRT outputs to proper format
-        results = trt_output_process_fn(y_pred, actual_batch_size, self.num_classes)
-        return results
+        return y_pred
 
     def __del__(self):
         """Clear things up on object deletion."""
@@ -161,19 +158,22 @@ class GDINOInferencer(TRTInferencer):
         label_strings = []
         for i in prediction:
             if int(i[0]) not in class_mapping:
-                print(i[0], class_mapping)
                 continue
             cls_name = class_mapping[int(i[0])]
             if float(i[1]) < threshold:
                 continue
 
-            if cls_name in color_map:
-                draw.rectangle(((i[2], i[3]), (i[4], i[5])),
-                               outline=color_map[cls_name])
-                # txt pad
-                draw.rectangle(((i[2], i[3] - 10), (i[2] + (i[4] - i[2]), i[3])),
-                               fill=color_map[cls_name])
-                draw.text((i[2], i[3] - 10), f"{cls_name}: {i[1]:.2f}")
+            if color_map and cls_name in color_map:
+                fill_color = color_map[cls_name]
+            else:
+                fill_color = "green"
+
+            draw.rectangle(((i[2], i[3]), (i[4], i[5])),
+                            outline=fill_color)
+            # txt pad
+            draw.rectangle(((i[2], i[3] - 10), (i[2] + (i[4] - i[2]), i[3])),
+                            fill=fill_color)
+            draw.text((i[2], i[3] - 10), f"{cls_name}: {i[1]:.2f}", fill="black")
 
             x1, y1, x2, y2 = float(i[2]), float(i[3]), float(i[4]), float(i[5])
             label_head = cls_name + " 0.00 0 0.00 "

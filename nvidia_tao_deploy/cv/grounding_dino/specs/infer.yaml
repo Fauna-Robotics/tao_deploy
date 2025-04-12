@@ -1,20 +1,20 @@
-results_dir: /home/scratch.p3/sean/groundingdino/tao_integration/
+results_dir: /opt/fauna/data/test_imgs/out/
 dataset:
   infer_data_sources:
     image_dir: 
-      # - /home/projects2_metropolis/datasets/kpi_datasets/People/C0042_4.mp4/images_final_hres/
-      - /home/scratch.p3/sean/temp/
-    captions: ["dog", "cat"]
-  batch_size: 4
+      - /opt/fauna/data/test_imgs
+    captions: ["wallet", "keys", "ignore everything else"]
+  batch_size: 1
   workers: 8
 inference:
-  trt_engine: /home/scratch.p3/sean/groundingdino/tao_integration/swint2.engine
-  conf_threshold: 0.3
+  trt_engine: "/opt/fauna/cache/online_mapping/grounding_dino.engine"
+  conf_threshold: 0.1
   input_width: 960
   input_height: 544
   color_map:
-    "dog": green
-    "cat": red
+    "keys": red
+    "wallet": blue
+    "people": yellow
 model:
   backbone: swin_tiny_224_1k
   num_feature_levels: 4

@@ -52,37 +52,43 @@ class HostDeviceMem(object):
         """Return the canonical string representation of the object."""
         return self.__str__()
 
+def do_inference(context, inputs, outputs, stream, return_raw=False):
+    """Inference function for TensorRT 10 using the new tensor I/O API.
 
-def do_inference(context, bindings, inputs,
-                 outputs, stream, batch_size=1,
-                 execute_v2=False, return_raw=False):
-    """Generalization for multiple inputs/outputs.
+    Args:
+        context: TensorRT execution context.
+        inputs: List of HostDeviceMem input buffers.
+        outputs: List of HostDeviceMem output buffers.
+        stream: PyCUDA stream.
+        return_raw: If True, return HostDeviceMem objects; else return host arrays.
 
-    inputs and outputs are expected to be lists of HostDeviceMem objects.
+    Returns:
+        Inference results as raw buffers or NumPy arrays.
     """
-    # Transfer input data to the GPU.
+    # Set input tensor addresses and copy input data
     for inp in inputs:
+        context.set_tensor_address(inp.name, int(inp.device))
         cuda.memcpy_htod_async(inp.device, inp.host, stream)
-    # Run inference.
-    if execute_v2:
-        context.execute_async_v2(bindings=bindings, stream_handle=stream.handle)
-    else:
-        context.execute_async(batch_size=batch_size, bindings=bindings, stream_handle=stream.handle)
+
+    # Set output tensor addresses
+    for out in outputs:
+        context.set_tensor_address(out.name, int(out.device))
+
+    # Run inference
+    context.execute_async_v3(stream_handle=stream.handle)
+
     # Transfer predictions back from the GPU.
     for out in outputs:
         cuda.memcpy_dtoh_async(out.host, out.device, stream)
+
     # Synchronize the stream
     stream.synchronize()
 
-    if return_raw:
-        return outputs
-
     # Return only the host outputs.
-    return [out.host for out in outputs]
-
+    return outputs if return_raw else [out.host for out in outputs]
 
 def allocate_buffers(engine, context=None, reshape=False):
-    """Allocates host and device buffer for TRT engine inference.
+    """Allocates host and device buffer for TRT 10 engine inference.
 
     This function is similair to the one in common.py, but
     converts network outputs (which are np.float32) appropriately
@@ -92,69 +98,67 @@ def allocate_buffers(engine, context=None, reshape=False):
 
     Args:
         engine (trt.ICudaEngine): TensorRT engine
-        context (trt.IExecutionContext): Context for dynamic shape engine
-        reshape (bool): To reshape host memory or not (FRCNN)
+        context (trt.IExecutionContext): Required for dynamic shape engines
+        reshape (bool): Whether to reshape host memory (e.g., for FRCNN)
 
     Returns:
         inputs [HostDeviceMem]: engine input memory
         outputs [HostDeviceMem]: engine output memory
-        bindings [int]: buffer to device bindings
-        stream (cuda.Stream): cuda stream for engine inference synchronization
+        bindings [int]: device addresses for set_tensor_address
+        stream (cuda.Stream): CUDA stream for async transfers
     """
-    inputs = []
-    outputs = []
-    bindings = []
+    assert context is not None, "TRT 10 requires context to get dynamic tensor shapes"
+
+    inputs, outputs, bindings = [], [], []
     stream = cuda.Stream()
 
-    # Current NMS implementation in TRT only supports DataType.FLOAT but
-    # it may change in the future, which could brake this sample here
-    # when using lower precision [e.g. NMS output would not be np.float32
-    # anymore, even though this is assumed in binding_to_type]
-    binding_to_type = {"Input": np.float32, "NMS": np.float32, "NMS_1": np.int32,
-                       "BatchedNMS": np.int32, "BatchedNMS_1": np.float32,
-                       "BatchedNMS_2": np.float32, "BatchedNMS_3": np.float32,
-                       "generate_detections": np.float32,
-                       "mask_head/mask_fcn_logits/BiasAdd": np.float32,
-                       "softmax_1": np.float32,
-                       "input_1": np.float32,
-                       # D-DETR
-                       "inputs": np.float32,
-                       "pred_boxes": np.float32,
-                       "pred_logits": np.float32,
-                       "pred_masks": np.float32}
+    # Explicit override of expected types for known plugin layers
+    binding_to_type = {
+        "Input": np.float32,
+        "NMS": np.float32,
+        "NMS_1": np.int32,
+        "BatchedNMS": np.int32,
+        "BatchedNMS_1": np.float32,
+        "BatchedNMS_2": np.float32,
+        "BatchedNMS_3": np.float32,
+        "generate_detections": np.float32,
+        "mask_head/mask_fcn_logits/BiasAdd": np.float32,
+        "softmax_1": np.float32,
+        "input_1": np.float32,
+        "inputs": np.float32,
+        "pred_boxes": np.float32,
+        "pred_logits": np.float32,
+        "pred_masks": np.float32,
+    }
 
-    for binding in engine:
-        binding_id = engine.get_binding_index(str(binding))
-        binding_name = engine.get_binding_name(binding_id)
-        if context:
-            size = trt.volume(context.get_binding_shape(binding_id))
-            dims = context.get_binding_shape(binding_id)
-        else:
-            size = trt.volume(engine.get_binding_shape(binding)) * engine.max_batch_size
-            dims = engine.get_binding_shape(binding)
-        # avoid error when bind to a number (YOLO BatchedNMS)
-        size = engine.max_batch_size if size == 0 else size
-        if str(binding) in binding_to_type:
-            dtype = binding_to_type[str(binding)]
-        else:
-            dtype = trt.nptype(engine.get_binding_dtype(binding))
-        # Allocate host and device buffers
+    for i in range(engine.num_io_tensors):
+        name = engine.get_tensor_name(i)
+        mode = engine.get_tensor_mode(name)
+        is_input = mode == trt.TensorIOMode.INPUT
+
+        # Get shape from the context (dynamic) or engine (static)
+        dims = context.get_tensor_shape(name)
+        size = trt.volume(dims)
+        size = max(size, 1)  # avoid 0-sized outputs like BatchedNMS
+
+        # Determine dtype
+        dtype = binding_to_type.get(name, trt.nptype(engine.get_tensor_dtype(name)))
+
+        # Allocate host/device memory
         host_mem = cuda.pagelocked_empty(size, dtype)
 
-        # FRCNN requires host memory to be reshaped into target shape
-        if reshape and not engine.binding_is_input(binding):
-            if engine.has_implicit_batch_dimension:
-                target_shape = (engine.max_batch_size, dims[0], dims[1], dims[2])
-            else:
-                target_shape = dims
-            host_mem = host_mem.reshape(*target_shape)
+        if reshape and not is_input:
+            host_mem = host_mem.reshape(*dims)
 
         device_mem = cuda.mem_alloc(host_mem.nbytes)
         # Append the device buffer to device bindings.
         bindings.append(int(device_mem))
+
+        mem = HostDeviceMem(host_mem, device_mem, dims, name=name)
         # Append to the appropriate list.
-        if engine.binding_is_input(binding):
-            inputs.append(HostDeviceMem(host_mem, device_mem, dims, name=binding_name))
+        if is_input:
+            inputs.append(mem)
         else:
-            outputs.append(HostDeviceMem(host_mem, device_mem, dims, name=binding_name))
+            outputs.append(mem)
+
     return inputs, outputs, bindings, stream

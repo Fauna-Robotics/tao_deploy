@@ -78,7 +78,7 @@ class UNetLoader(ABC):
         self.input_image_type = input_image_type
 
         # Always assume channel first
-        self.num_channels, self.height, self.width = shape[0], shape[1], shape[2]
+        self.num_channels, self.height, self.width = shape[1], shape[2], shape[3]
 
         if self.num_channels == 1 and self.input_image_type != "grayscale":
             raise ValueError("A network with channel size 1 expects grayscale input image type")
