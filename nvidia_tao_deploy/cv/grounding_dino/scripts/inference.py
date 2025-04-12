@@ -52,7 +52,7 @@ def main(cfg: ExperimentConfig) -> None:
                                 batch_size=cfg.dataset.batch_size,
                                 num_classes=max_text_len)
 
-    c, h, w = trt_infer._input_shape[0]
+    _, c, h, w = trt_infer._input_shape[0]
     batcher = ImageBatcher(list(cfg.dataset.infer_data_sources.image_dir),
                            (cfg.dataset.batch_size, c, h, w),
                            trt_infer.inputs[0].host.dtype,
@@ -97,8 +97,8 @@ def main(cfg: ExperimentConfig) -> None:
             target_sizes.append([orig_w, orig_h, orig_w, orig_h])
 
         class_labels, scores, boxes = post_process(pred_logits, pred_boxes, target_sizes, pos_map)
+        merge_detections(scores, boxes, class_labels)
 
-        y_pred_valid = np.concatenate([class_labels[..., None], scores[..., None], boxes], axis=-1)
         for img_path, pred in zip(img_paths, y_pred_valid):
             # Load Image
             img = Image.open(img_path)
@@ -118,6 +118,38 @@ def main(cfg: ExperimentConfig) -> None:
 
     logging.info("Finished inference.")
 
+def merge_detections(scores, boxes, class_labels):
+    """
+    Applies NMS to the detections.
+    Note: This assumes batch size of 1.
+    """
+    # Build a dict for detections before applying NMS.
+    detections = [
+        [
+            {
+                "score": float(scores[0][i]),
+                "bbox": boxes[0][i].tolist(),
+                "label": int(class_labels[0][i]),
+            }
+            for i in range(len(scores[0]))
+        ]
+    ]
+    merged_detections = merge_outputs(detections)
+    merged = merged_detections[0]
+
+    class_labels = np.array([d["label"] for d in merged])
+    scores = np.array([d["score"] for d in merged])
+    boxes = np.array([d["bbox"] for d in merged])
+
+    # Ensure consistent shapes
+    class_labels = np.atleast_1d(class_labels).reshape(-1, 1)
+    scores = np.atleast_1d(scores).reshape(-1, 1)
+    boxes = np.atleast_2d(boxes).reshape(-1, 4)
+
+    # Concatenate to (N, 6)
+    y_pred = np.concatenate([class_labels, scores, boxes], axis=-1)
+    # Add batch dim to get (1, N, 6)
+    y_pred_valid = y_pred[None, ...]
 
 if __name__ == '__main__':
     main()

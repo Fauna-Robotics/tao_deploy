@@ -34,7 +34,7 @@ def trt_output_process_fn(y_encoded, batch_size, num_classes):
         pred_logits (np.ndarray): (B x NQ x N) logits of the prediction
         pred_boxes (np.ndarray): (B x NQ x 4) bounding boxes of the prediction
     """
-    pred_boxes, pred_logits = y_encoded
+    pred_logits, pred_boxes = y_encoded
     return pred_logits.reshape((batch_size, -1, num_classes)), pred_boxes.reshape((batch_size, -1, 4))
 
 
@@ -53,7 +53,12 @@ class GDINOInferencer(TRTInferencer):
         """
         # Load TRT engine
         super().__init__(engine_path)
-        self.max_batch_size = self.engine.max_batch_size
+
+        # Find max shape
+        binding_index = self.engine.get_binding_index(self.engine.get_binding_name(0))
+        min_shape, opt_shape, max_shape = self.engine.get_profile_shape(0, binding_index)
+        self.max_batch_size = max_shape[0]
+
         self.execute_v2 = False
 
         # Execution context is needed for inference
