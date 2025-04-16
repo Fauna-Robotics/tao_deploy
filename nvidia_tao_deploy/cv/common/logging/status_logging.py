@@ -14,14 +14,14 @@
 
 """Logger class for TAO Deploy models."""
 
-from abc import abstractmethod
 import atexit
-from datetime import datetime
 import json
 import logging
 import os
+from abc import abstractmethod
+from datetime import datetime
 
-from nvidia_tao_core.cloud_handlers.utils import status_callback
+# from nvidia_tao_core.cloud_handlers.utils import status_callback
 
 
 logger = logging.getLogger(__name__)
@@ -179,7 +179,7 @@ class BaseLogger(object):
             if self.is_master:
                 self.log(verbosity_level, data_string)
             self.flush()
-            status_callback(data_string)
+            # status_callback(data_string)
 
 
 class StatusLogger(BaseLogger):
