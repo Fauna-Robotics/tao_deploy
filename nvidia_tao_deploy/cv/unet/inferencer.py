@@ -43,8 +43,14 @@ def trt_output_process_fn(y_encoded, model_output_width, model_output_height, ac
 
 class UNetInferencer(TRTInferencer):
     """Manages TensorRT objects for model inference."""
-
-    def __init__(self, engine_path, input_shape=None, batch_size=None, data_format="channel_first", activation="softmax"):
+    def __init__(
+        self,
+        engine_path,
+        input_shape=None,
+        batch_size=None,
+        data_format="channel_first",
+        activation="softmax",
+    ):
         """Initializes TensorRT objects needed for model inference.
 
         Args:
@@ -53,48 +59,54 @@ class UNetInferencer(TRTInferencer):
             batch_size (int): batch size for dynamic shape engine
             data_format (str): either channel_first or channel_last
         """
-        # Load TRT engine
+
         super().__init__(engine_path)
-        self.max_batch_size = self.engine.max_batch_size
-        self.execute_v2 = False
         self.activation = activation
+        self.context = self.engine.create_execution_context()
 
-        # Execution context is needed for inference
-        self.context = None
-
-        # Allocate memory for multiple usage [e.g. multiple batch inference]
+        # Get input tensor name and shape
+        self.input_tensor_name = None
         self._input_shape = []
-        for binding in range(self.engine.num_bindings):
-            if self.engine.binding_is_input(binding):
-                self._input_shape = self.engine.get_binding_shape(binding)[-3:]
-        assert len(self._input_shape) == 3, "Engine doesn't have valid input dimensions"
 
+        for i in range(self.engine.num_io_tensors):
+            name = self.engine.get_tensor_name(i)
+            if self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
+                self.input_tensor_name = name
+                self._input_shape = list(self.engine.get_tensor_shape(name))
+                break
+
+        assert self.input_tensor_name is not None, "No input tensor found in the engine"
+        assert len(self._input_shape) == 4, "Expected shape (N,C,H,W) or similar"
+
+        # Handle batch size or dynamic shapes
+        if input_shape is not None:
+            self.context.set_input_shape(self.input_tensor_name, input_shape)
+            self.max_batch_size = input_shape[0]
+        elif batch_size is not None:
+            dynamic_shape = [batch_size] + self._input_shape[1:]
+            self.context.set_input_shape(self.input_tensor_name, dynamic_shape)
+            self.max_batch_size = batch_size
+        else:
+            self.max_batch_size = self._input_shape[0]  # May be -1 for dynamic
+
+        # Set width and height based on data_format
         if data_format == "channel_first":
+            self.height = self._input_shape[2]
+            self.width = self._input_shape[3]
+        else:
             self.height = self._input_shape[1]
             self.width = self._input_shape[2]
-        else:
-            self.height = self._input_shape[0]
-            self.width = self._input_shape[1]
 
-        # set binding_shape for dynamic input
-        if (input_shape is not None) or (batch_size is not None):
-            self.context = self.engine.create_execution_context()
-            if input_shape is not None:
-                self.context.set_binding_shape(0, input_shape)
-                self.max_batch_size = input_shape[0]
-            else:
-                self.context.set_binding_shape(0, [batch_size] + list(self._input_shape))
-                self.max_batch_size = batch_size
-            self.execute_v2 = True
+        # Allocate buffers using new TRT 10 API
+        self.inputs, self.outputs, self.bindings, self.stream = allocate_buffers(
+            self.engine, self.context
+        )
 
-        # This allocates memory for network inputs/outputs on both CPU and GPU
-        self.inputs, self.outputs, self.bindings, self.stream = allocate_buffers(self.engine,
-                                                                                 self.context)
-        if self.context is None:
-            self.context = self.engine.create_execution_context()
-
-        input_volume = trt.volume(self._input_shape)
-        self.numpy_array = np.zeros((self.max_batch_size, input_volume))
+        # Preallocate numpy buffer
+        input_volume = trt.volume(self._input_shape[1:])  # exclude batch
+        self.numpy_array = np.zeros(
+            (self.max_batch_size, input_volume), dtype=np.float32
+        )
 
     def infer(self, imgs):
         """Infers model on batch of same sized images resized to fit the model.
@@ -173,6 +185,7 @@ class UNetInferencer(TRTInferencer):
 
         for pred, img_path in zip(predictions, img_paths):
             segmented_img = np.zeros((self.height, self.width, 3))
+            pred = self.remove_small_regions(pred, class_id=1, min_area=5000)
             img_file_name = os.path.basename(img_path)
             for c in range(len(colors)):
                 seg_arr_c = pred[:, :] == c
@@ -204,3 +217,14 @@ class UNetInferencer(TRTInferencer):
 
             # Save predictions
             cv2.imwrite(os.path.join(label_dir, mask_name), pred)
+
+    def remove_small_regions(self, mask, class_id=1, min_area=2000):
+        """Remove small connected components of the specified class."""
+        binary_mask = (mask == class_id).astype(np.uint8)
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            binary_mask, connectivity=8
+        )
+        for i in range(0, num_labels):  # Skip background
+            if stats[i, cv2.CC_STAT_AREA] < min_area:
+                mask[labels == i] = 0  # Replace with background
+        return mask
