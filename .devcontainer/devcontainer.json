@@ -1,0 +1,41 @@
+{
+  "$schema": "https://raw.githubusercontent.com/devcontainers/spec/main/schemas/devContainer.schema.json",
+  "name": "tao-deploy",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": "../../.."
+  },
+  "containerUser": "dev",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace/fauna,type=bind",
+  "workspaceFolder": "/workspace/fauna",
+  "privileged": true,
+  "runArgs": [
+    "--net=host",
+    "--gpus=all",
+    "--name",
+    "tao-deploy"
+  ],
+  "remoteEnv": {
+    "POETRY_VIRTUALENVS_OPTIONS_SYSTEM_SITE_PACKAGES": "true",
+    "POETRY_VIRTUALENVS_IN_PROJECT": "false"
+  },
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "username": "dev",
+      "upgradePackages": false,
+      "installOhMyZsh": false,
+      "installZsh": false
+    },
+    "../../../.devcontainer/features/shell-history": {
+      "username": "dev",
+      "userhome": "/home/dev"
+    },
+    "../../../.devcontainer/features/default-extensions": {},
+    "../../../.devcontainer/features/python-analysis-paths": {},
+    "../../../.devcontainer/features/cyclone-dds-forward": {},
+    "../../../.devcontainer/features/mise": {
+      "username": "dev",
+      "userhome": "/home/dev"
+    }
+  }
+}
