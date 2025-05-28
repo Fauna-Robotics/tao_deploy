@@ -75,7 +75,7 @@ class DetectNetInferencer(TRTInferencer):
         """
         # Load TRT engine
         super().__init__(engine_path)
-        self.max_batch_size = self.engine.max_batch_size
+        # self.max_batch_size = self.engine.max_batch_size
         self.execute_v2 = False
         self.target_classes = target_classes
 
