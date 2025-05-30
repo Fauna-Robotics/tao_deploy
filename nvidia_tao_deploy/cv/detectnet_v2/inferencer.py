@@ -56,7 +56,6 @@ def trt_output_process_fn(y_encoded,
         key = target_classes[i]
         out2cluster[key] = {'cov': output_meta_cov[:, i, :, :],  # pylint: disable=possibly-used-before-assignment
                             'bbox': output_meta_bbox[:, 4 * i: 4 * i + 4, :, :]}  # pylint: disable=possibly-used-before-assignment
-    # breakpoint()
     return out2cluster
 
 
