@@ -56,7 +56,6 @@ def trt_output_process_fn(y_encoded,
         key = target_classes[i]
         out2cluster[key] = {'cov': output_meta_cov[:, i, :, :],  # pylint: disable=possibly-used-before-assignment
                             'bbox': output_meta_bbox[:, 4 * i: 4 * i + 4, :, :]}  # pylint: disable=possibly-used-before-assignment
-
     return out2cluster
 
 
@@ -75,7 +74,7 @@ class DetectNetInferencer(TRTInferencer):
         """
         # Load TRT engine
         super().__init__(engine_path)
-        self.max_batch_size = self.engine.max_batch_size
+        self.max_batch_size = None
         self.execute_v2 = False
         self.target_classes = target_classes
 
@@ -84,14 +83,32 @@ class DetectNetInferencer(TRTInferencer):
 
         # Allocate memory for multiple usage [e.g. multiple batch inference]
         self._input_shape = []
-        for binding in range(self.engine.num_bindings):
-            if self.engine.binding_is_input(binding):
-                binding_shape = self.engine.get_binding_shape(binding)
-                self._input_shape = binding_shape[-3:]
+
+        for i in range(self.engine.num_io_tensors):
+            name = self.engine.get_tensor_name(i)
+            if self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
+                binding_shape = self.engine.get_tensor_profile_shape(name, 0)[1]
+                self._input_shape = list(binding_shape)[-3:]
                 if len(binding_shape) == 4:
                     self.etlt_type = "onnx"
                 else:
                     self.etlt_type = "uff"
+                if self.context is None:
+                    self.context = self.engine.create_execution_context()
+
+                # set binding_shape for dynamic input
+                # do not override if the original model was uff
+                if (input_shape is not None or batch_size is not None) and (self.etlt_type != "uff"):
+                    if input_shape is not None:
+                        self.context.set_input_shape(name, input_shape)
+                        self.max_batch_size = input_shape[0]
+                    else:
+                        self.context.set_input_shape(name, [batch_size] + self._input_shape)
+                        self.max_batch_size = batch_size
+                    self.execute_v2 = True            
+
+                if self.max_batch_size is None:
+                    self.max_batch_size = self.engine.get_tensor_profile_shape(name, 0)[2][0]
         assert len(self._input_shape) == 3, "Engine doesn't have valid input dimensions"
 
         if data_format == "channel_first":
@@ -101,22 +118,8 @@ class DetectNetInferencer(TRTInferencer):
             self.height = self._input_shape[0]
             self.width = self._input_shape[1]
 
-        # set binding_shape for dynamic input
-        # do not override if the original model was uff
-        if (input_shape is not None or batch_size is not None) and (self.etlt_type != "uff"):
-            self.context = self.engine.create_execution_context()
-            if input_shape is not None:
-                self.context.set_binding_shape(0, input_shape)
-                self.max_batch_size = input_shape[0]
-            else:
-                self.context.set_binding_shape(0, [batch_size] + list(self._input_shape))
-                self.max_batch_size = batch_size
-            self.execute_v2 = True
         # This allocates memory for network inputs/outputs on both CPU and GPU
-        self.inputs, self.outputs, self.bindings, self.stream = allocate_buffers(self.engine,
-                                                                                 self.context)
-        if self.context is None:
-            self.context = self.engine.create_execution_context()
+        self.inputs, self.outputs, self.bindings, self.stream = allocate_buffers(self.engine, self.context)
 
         input_volume = trt.volume(self._input_shape)
         self.numpy_array = np.zeros((self.max_batch_size, input_volume))
@@ -141,11 +144,11 @@ class DetectNetInferencer(TRTInferencer):
 
         # ...fetch model outputs...
         results = do_inference(
-            self.context, bindings=self.bindings, inputs=self.inputs,
+            self.context, inputs=self.inputs,
             outputs=self.outputs, stream=self.stream,
-            batch_size=max_batch_size,
-            execute_v2=self.execute_v2,
-            return_raw=True)
+            return_raw=True
+            )
+        
         dims = [out.numpy_shape for out in results]
         outputs = [out.host for out in results]
 
@@ -190,8 +193,9 @@ class DetectNetInferencer(TRTInferencer):
         label_strings = []
         for i in prediction:
             cls_name = class_mapping[int(i[0])]
-            if float(i[1]) < threshold[cls_name]:
-                continue
+            if threshold is not None:
+                if float(i[1]) < threshold[cls_name]:
+                    continue
             draw.rectangle(((i[2], i[3]), (i[4], i[5])),
                            outline=color_map[cls_name])
             # txt pad
